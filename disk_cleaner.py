@@ -1115,7 +1115,7 @@ class CleanerApp:
         if not messagebox.askyesno(
             "确认删除",
             f"将把 {len(allowed)} 个文件(共 {core.human_size(total)})移入回收站。"
-            f"{blocked_note}{notice_note}\n\n之后仍可从回收站还原。确定继续吗?",
+            f"{blocked_note}{notice_note}{self._recycle_note(allowed)}\n\n确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "大文件", self._prune_large_tree)
@@ -1250,7 +1250,7 @@ class CleanerApp:
         if not messagebox.askyesno(
             "确认删除",
             f"将把 {len(allowed)} 个重复文件(共 {core.human_size(total)})移入回收站, 每组保留一份。"
-            f"{blocked_note}{notice_note}\n\n确定继续吗?",
+            f"{blocked_note}{notice_note}{self._recycle_note(allowed)}\n\n确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "重复文件", self._prune_dup_tree)
@@ -1277,7 +1277,7 @@ class CleanerApp:
         if not messagebox.askyesno(
             "确认删除",
             f"将把选中的 {len(allowed)} 个文件(共 {core.human_size(total)})移入回收站。"
-            f"{blocked_note}{notice_note}\n\n确定继续吗?",
+            f"{blocked_note}{notice_note}{self._recycle_note(allowed)}\n\n确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "重复文件", self._prune_dup_tree)
@@ -1402,6 +1402,15 @@ class CleanerApp:
             return ""
         summary = "、".join(f"{kind} {count} 个" for kind, count in sorted(counts.items()))
         return f"\n其中包含 {summary}, 删除前请确认仍需要保留。"
+
+    @staticmethod
+    def _recycle_note(paths: list[str]) -> str:
+        """根据目标所在卷, 说明删除后能否从回收站还原。"""
+        unsafe = core.unsupported_recycle_paths(paths)
+        if not unsafe:
+            return "\n\n之后仍可从回收站还原。"
+        return (f"\n\n其中 {len(unsafe)} 个文件位于网络位置或可移动磁盘, "
+                "这些位置通常不支持回收站, 删除后可能无法还原。")
 
     def _move_to_recycle(self, paths: list[str], label: str, on_done=None) -> None:
         def work(cancel, report):

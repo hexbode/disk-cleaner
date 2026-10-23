@@ -192,7 +192,63 @@ if IS_WINDOWS:
     _CloseHandle = _kernel32.CloseHandle
     _CloseHandle.restype = wintypes.BOOL
     _CloseHandle.argtypes = [wintypes.HANDLE]
+    _GetDriveTypeW = _kernel32.GetDriveTypeW
+    _GetDriveTypeW.restype = wintypes.UINT
+    _GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     _INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+# GetDriveTypeW 的返回值
+DRIVE_UNKNOWN = 0
+DRIVE_NO_ROOT_DIR = 1
+DRIVE_REMOVABLE = 2
+DRIVE_FIXED = 3
+DRIVE_REMOTE = 4
+DRIVE_CDROM = 5
+DRIVE_RAMDISK = 6
+
+
+def recycle_bin_supported(path: str) -> bool:
+    """该路径所在的卷是否能比较可靠地使用回收站。
+
+    本地固定磁盘通常可以; 网络位置一般没有回收站, 可移动磁盘只有在已经
+    存在 $Recycle.Bin 时才认为可用。其他类型(光盘、内存盘)一律视为不支持。
+    非 Windows 平台返回 False。
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        drive, _tail = os.path.splitdrive(os.path.abspath(path))
+    except (OSError, ValueError):
+        return False
+    # UNC 路径直接判定为不支持: 既符合实际情况, 也避免探测不存在的服务器时卡住
+    if drive.startswith("\\\\"):
+        return False
+    kind = _GetDriveTypeW(drive + "\\")
+    if kind == DRIVE_FIXED:
+        return True
+    if kind == DRIVE_REMOVABLE:
+        return os.path.isdir(os.path.join(drive + "\\", "$Recycle.Bin"))
+    return False
+
+
+def unsupported_recycle_paths(paths: Iterable[str]) -> list[str]:
+    """从路径列表中筛出所在卷不支持回收站的项(用于删除前提示)。
+
+    同一个卷只检测一次, 避免批量文件重复查询驱动器类型。
+    """
+    checked: dict[str, bool] = {}
+    result: list[str] = []
+    for path in paths:
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0].lower()
+        except (OSError, ValueError):
+            drive = ""
+        if drive not in checked:
+            checked[drive] = recycle_bin_supported(path)
+        if not checked[drive]:
+            result.append(path)
+    return result
 
 
 def is_file_in_use(path: str) -> bool:

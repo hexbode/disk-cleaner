@@ -345,6 +345,19 @@ class RecycleBinTest(unittest.TestCase):
     def test_empty_input_is_noop(self):
         self.assertEqual(core.move_to_recycle_bin([]), (0, 0, []))
 
+    def test_local_fixed_drive_supports_recycle_bin(self):
+        root = os.path.splitdrive(os.environ.get("SystemRoot", r"C:\Windows"))[0] + "\\"
+        self.assertTrue(core.recycle_bin_supported(os.path.join(root, "x.tmp")))
+
+    def test_unc_path_is_not_supported(self):
+        self.assertFalse(core.recycle_bin_supported(r"\\server\share\file.bin"))
+
+    def test_unsupported_filter(self):
+        root = os.path.splitdrive(os.environ.get("SystemRoot", r"C:\Windows"))[0] + "\\"
+        local = os.path.join(root, "a.tmp")
+        remote = r"\\server\share\b.bin"
+        self.assertEqual(core.unsupported_recycle_paths([local, remote]), [remote])
+
 
 if __name__ == "__main__":
     unittest.main()
