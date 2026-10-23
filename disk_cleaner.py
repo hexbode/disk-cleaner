@@ -10,13 +10,15 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import queue
 import shutil
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import cleaner_core as core
 
@@ -61,6 +63,27 @@ def parse_size(text: str) -> int:
     """把 '100 MB' 这样的字符串转成字节数。"""
     number, unit = text.split()
     return int(float(number) * UNIT_TABLE[unit.upper()])
+
+
+def parse_display_size(text: str) -> float:
+    """把 '1,024.0 MB' 这类展示文本还原成字节数; 无法解析时返回 -1。"""
+    try:
+        number, unit = text.split()
+        return float(number.replace(",", "")) * UNIT_TABLE[unit.upper()]
+    except (ValueError, KeyError):
+        return -1.0
+
+
+# Excel 会把以这些字符开头的单元格当作公式执行(CSV 公式注入)
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_cell(value: str) -> str:
+    """给可能被 Excel 解释为公式的文本加前导单引号。"""
+    stripped = value.lstrip("\t\r\n ")
+    if stripped and stripped[0] in _FORMULA_PREFIXES:
+        return "'" + value
+    return value
 
 
 # --------------------------------------------------------------- 自绘基础件
@@ -275,6 +298,48 @@ class Card(tk.Frame):
         self.body.pack(fill="both", expand=True, padx=padding[0], pady=padding[1])
 
 
+class ScrollArea(tk.Frame):
+    """固定最大高度的纵向滚动容器, 内容放入 .inner。"""
+
+    def __init__(self, parent, *, max_height=240, bg=None):
+        bg = bg or parent.cget("bg")
+        super().__init__(parent, bg=bg)
+        self._max_height = max_height
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0, height=max_height)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.inner.bind("<Configure>", self._sync_region)
+        self.canvas.bind("<Configure>", self._sync_width)
+        self.canvas.bind("<Enter>", self._bind_wheel)
+        self.canvas.bind("<Leave>", self._unbind_wheel)
+
+    def _sync_region(self, _event=None) -> None:
+        bbox = self.canvas.bbox("all")
+        if bbox:
+            self.canvas.configure(scrollregion=bbox)
+
+    def _sync_width(self, event) -> None:
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def fit(self, rows: int, row_height: int = 44) -> None:
+        """按内容行数调整可见高度; 超过上限时固定高度并滚动。"""
+        self.canvas.configure(height=max(60, min(self._max_height, rows * row_height)))
+        self._sync_region()
+
+    def _bind_wheel(self, _event=None) -> None:
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _unbind_wheel(self, _event=None) -> None:
+        self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_wheel(self, event) -> None:
+        self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+
 class Bar(tk.Canvas):
     """静态度量条(用于磁盘占用展示)。"""
 
@@ -345,7 +410,8 @@ SECTION_META = {
 
 LEGEND_TEXT = (
     "受保护的项不会被删除: 「占用中」= 正被程序使用(含已加载的程序模块); "
-    "「程序文件 / 数据文件 / 虚拟机磁盘」= 属于系统或已安装程序的文件; "
+    "「程序文件 / 数据文件 / 虚拟机磁盘」= 属于系统、已安装程序或重要数据。"
+    "「安装包 / 日志文件 / 备份文件 / 镜像 / 邮件缓存」= 可以删除, 但建议先确认; "
     "「未占用」= 可以删除。"
 )
 
@@ -363,6 +429,9 @@ class CleanerApp:
         self.large_paths: dict[str, str] = {}
         self.dup_paths: dict[str, str] = {}
         self.dup_groups: list[core.DupGroup] = []
+        self.dup_locked: set[str] = set()
+        self.custom_dirs: list[str] = core.load_custom_dirs(include_missing=True)
+        self._reclaim_cache: tuple[float, core.ScanResult] | None = None
 
         root.title("硬盘清理工具")
         screen_w = root.winfo_screenwidth()
@@ -439,7 +508,7 @@ class CleanerApp:
         self.admin_badge = Badge(footer, "检测中", fg=C["sidebar_text"], bg=C["sidebar_hi"],
                                  dot=C["faint"], font=(FONT, 9))
         self.admin_badge.pack(anchor="w")
-        tk.Label(footer, text="v1.0", bg=C["sidebar"], fg="#4c5a70",
+        tk.Label(footer, text="v1.1", bg=C["sidebar"], fg="#4c5a70",
                  font=(FONT, 8)).pack(anchor="w", pady=(8, 0))
 
     # ------------------------------------------------------------ 主区域
@@ -589,28 +658,48 @@ class CleanerApp:
         bar._cw = event.width
         bar.set_ratio(ratio)
 
-    def _compute_reclaimable(self) -> None:
+    def _compute_reclaimable(self, force: bool = False) -> None:
+        """统计临时文件占用量; 一分钟内复用上次结果, 避免每次切页都全盘重扫。"""
+        if not force and self._reclaim_cache is not None:
+            age = time.monotonic() - self._reclaim_cache[0]
+            if age < 60:
+                self._show_reclaimable(self._reclaim_cache[1])
+                return
+        if self._busy:
+            # 已有任务在跑(例如正在扫描大文件), 稍后再统计, 避免两个任务互相干扰
+            self.root.after(800, lambda: self._compute_reclaimable(force))
+            return
+
         def work(cancel, report):
             targets = core.default_targets()
             return core.scan_targets(targets, cancel=cancel, progress=report)
 
         def done(result: core.ScanResult) -> None:
-            self.overview_hint.configure(
-                text=f"临时文件与缓存约占用 {core.human_size(result.total_bytes)} "
-                     f"({result.file_count} 个文件), 清理后可释放这部分空间。")
+            self._reclaim_cache = (time.monotonic(), result)
+            self._show_reclaimable(result)
 
         self.run_task(work, done)
 
+    def _show_reclaimable(self, result: core.ScanResult) -> None:
+        self.overview_hint.configure(
+            text=f"临时文件与缓存约占用 {core.human_size(result.total_bytes)} "
+                 f"({result.file_count} 个文件), 清理后可释放这部分空间。")
+
     # ------------------------------------------------------ 通用小工具
 
-    def _make_tree(self, parent: tk.Widget, columns: list[tuple[str, str, int, str]]) -> ttk.Treeview:
+    def _make_tree(self, parent: tk.Widget, columns: list[tuple[str, str, int, str]],
+                   *, sortable: bool = True) -> ttk.Treeview:
         frame = tk.Frame(parent, bg=C["card"], highlightthickness=1,
                          highlightbackground=C["card_line"])
         frame.pack(fill="both", expand=True, pady=(12, 0))
         tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings",
                             selectmode="extended")
         for key, title, width, anchor in columns:
-            tree.heading(key, text=title)
+            if sortable:
+                tree.heading(key, text=title,
+                             command=lambda c=key, t=tree: self._sort_tree(t, c))
+            else:
+                tree.heading(key, text=title)
             tree.column(key, width=width, anchor=anchor, stretch=(anchor == "w"))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
@@ -620,15 +709,70 @@ class CleanerApp:
         tree.tag_configure("group", background=C["accent_soft"], font=(FONT, 10, "bold"))
         tree.tag_configure("inuse", foreground=C["red"])
         tree.tag_configure("risk", foreground=C["amber"])
-        tree.bind("<<TreeviewSelect>>", lambda _e: None)
+        tree.tag_configure("notice", foreground="#0e7490")
+        tree._sort_state = {}
         return tree
+
+    @staticmethod
+    def _sort_tree(tree: ttk.Treeview, column: str) -> None:
+        """点击列头排序: 首次升序, 再次点击改为降序。"""
+        state = getattr(tree, "_sort_state", {})
+        reverse = state.get(column, False)
+        state[column] = not reverse
+        tree._sort_state = state
+
+        def sort_key(iid: str):
+            value = tree.set(iid, column)
+            if column == "size":
+                return parse_display_size(value)
+            if column == "count":
+                try:
+                    return int(value)
+                except ValueError:
+                    return 0
+            return value.lower()
+
+        children = list(tree.get_children(""))
+        children.sort(key=sort_key, reverse=reverse)
+        for index, iid in enumerate(children):
+            tree.move(iid, "", index)
+
+    def _export_tree(self, tree: ttk.Treeview, name: str) -> None:
+        """把表格当前内容导出为 CSV(UTF-8 带 BOM, Excel 可直接打开)。"""
+        children = tree.get_children("")
+        if not children:
+            messagebox.showinfo("提示", "当前没有可导出的数据, 请先扫描。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出为 CSV",
+            defaultextension=".csv",
+            initialfile=f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        columns = list(tree["columns"])
+        headers = [tree.heading(column)["text"] for column in columns]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                for iid in children:
+                    writer.writerow([csv_cell(tree.set(iid, column)) for column in columns])
+                    for child in tree.get_children(iid):
+                        writer.writerow([csv_cell(tree.set(child, column)) for column in columns])
+        except OSError as exc:
+            messagebox.showerror("导出失败", f"写入文件时出错:\n{exc}")
+            return
+        self.set_status(f"已导出 {path}")
 
     @staticmethod
     def _row_status(index: int, path: str, locked: set[str],
                     with_risk: bool = True) -> tuple[str, tuple[str, ...]]:
         """返回 (删除提示, 标签元组)。
 
-        优先级: 占用中 > 风险类别 > 未占用。占用行标红、风险行标琥珀色。
+        优先级: 占用中 > 禁止删除的风险 > 建议确认 > 未占用。
+        占用/风险行标红或琥珀色, 提示行标青色(仍可删除)。
         """
         tags = ["odd"] if index % 2 else []
         if path in locked:
@@ -637,6 +781,9 @@ class CleanerApp:
             kind = core.deletion_risk(path)
             if kind:
                 return kind, tuple(tags + ["risk"])
+            notice = core.deletion_notice(path)
+            if notice:
+                return notice, tuple(tags + ["notice"])
         return "未占用", tuple(tags)
 
     def _field_row(self, parent, label, values, variable, width=10) -> None:
@@ -656,35 +803,32 @@ class CleanerApp:
     def _build_temp_tab(self, parent: tk.Frame) -> None:
         card = Card(parent, padding=(20, 16))
         card.pack(fill="x")
-        tk.Label(card.body, text="清理位置", bg=C["card"], fg=C["text"],
-                 font=(FONT, 12, "bold")).pack(anchor="w")
+        head = tk.Frame(card.body, bg=C["card"])
+        head.pack(fill="x")
+        tk.Label(head, text="清理位置", bg=C["card"], fg=C["text"],
+                 font=(FONT, 12, "bold")).pack(side="left")
+        Button(head, "添加目录", self.add_custom_dir, width=96, height=30,
+               fill="#eef1f6", hover="#e3e8f0", text_color=C["text"],
+               font=(FONT, 9), bg=C["card"]).pack(side="right")
         tk.Label(card.body, text="勾选需要清理的位置; 临时文件按系统惯例直接删除, 不会进入回收站。"
                                 "列表中的「占用中」表示文件正被程序使用(含已加载的程序模块), 清理时会被保留、不删除。",
-                 bg=C["card"], fg=C["muted"], font=(FONT, 9)).pack(anchor="w", pady=(2, 10))
+                 bg=C["card"], fg=C["muted"], font=(FONT, 9), justify="left",
+                 wraplength=860).pack(anchor="w", pady=(2, 10))
 
-        self.temp_targets = core.default_targets()
+        self.temp_scroll = ScrollArea(card.body, max_height=200, bg=C["card"])
+        self.temp_scroll.pack(fill="x")
+        self.temp_list = self.temp_scroll.inner
         self.temp_vars: dict[str, tk.BooleanVar] = {}
-        for target in self.temp_targets:
-            var = tk.BooleanVar(value=target.enabled)
-            self.temp_vars[target.key] = var
-            row = tk.Frame(card.body, bg=C["card"])
-            row.pack(fill="x", pady=3)
-            Switch(row, var, bg=C["card"]).pack(side="left")
-            text = tk.Frame(row, bg=C["card"])
-            text.pack(side="left", padx=(10, 0))
-            tk.Label(text, text=target.label, bg=C["card"], fg=C["text"],
-                     font=(FONT, 10, "bold")).pack(anchor="w")
-            tk.Label(text, text=target.note, bg=C["card"], fg=C["muted"],
-                     font=(FONT, 9)).pack(anchor="w")
-        if not self.temp_targets:
-            tk.Label(card.body, text="未找到可清理的默认位置。", bg=C["card"],
-                     fg=C["muted"]).pack(anchor="w")
+        self.temp_targets: list[core.CleanTarget] = []
+        self._reload_temp_targets()
 
         actions = tk.Frame(parent, bg=C["bg"])
         actions.pack(fill="x", pady=(14, 0))
         Button(actions, "扫描", self.scan_temp, fill=C["accent"], width=110).pack(side="left")
         Button(actions, "清理选中项", self.clean_temp, fill="#eef1f6", hover="#e3e8f0",
                text_color=C["text"], width=130).pack(side="left", padx=8)
+        Button(actions, "导出 CSV", lambda: self._export_tree(self.temp_tree, "临时文件"),
+               fill="#eef1f6", hover="#e3e8f0", text_color=C["text"], width=100).pack(side="left")
 
         self.temp_summary = self._summary_label(parent)
         self.temp_tree = self._make_tree(
@@ -692,6 +836,75 @@ class CleanerApp:
             [("state", "删除提示", 90, "center"), ("size", "大小", 110, "e"),
              ("name", "文件", 290, "w"), ("path", "所在目录", 480, "w")],
         )
+
+    def _reload_temp_targets(self) -> None:
+        """按内置目标 + 自定义目录重建列表, 尽量保留用户已做的勾选。"""
+        previous = {key: var.get() for key, var in self.temp_vars.items()}
+        for child in self.temp_list.winfo_children():
+            child.destroy()
+        self.temp_targets = core.default_targets() + core.custom_targets(self.custom_dirs)
+        self.temp_vars = {}
+        for target in self.temp_targets:
+            var = tk.BooleanVar(value=previous.get(target.key, target.enabled))
+            self.temp_vars[target.key] = var
+            self._render_target_row(target, var)
+        if not self.temp_targets:
+            tk.Label(self.temp_list, text="未找到可清理的默认位置。", bg=C["card"],
+                     fg=C["muted"]).pack(anchor="w")
+        else:
+            self.temp_scroll.fit(len(self.temp_targets))
+
+    def _render_target_row(self, target: core.CleanTarget, var: tk.BooleanVar) -> None:
+        row = tk.Frame(self.temp_list, bg=C["card"])
+        row.pack(fill="x", pady=3)
+        Switch(row, var, bg=C["card"]).pack(side="left")
+        if target.custom:
+            remove = tk.Label(row, text="移除", bg=C["card"], fg=C["faint"],
+                              font=(FONT, 9), cursor="hand2")
+            remove.pack(side="right", padx=(12, 0))
+            remove.bind("<Button-1>", lambda _e, p=target.paths[0]: self.remove_custom_dir(p))
+        text = tk.Frame(row, bg=C["card"])
+        text.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        tk.Label(text, text=target.label, bg=C["card"], fg=C["text"],
+                 font=(FONT, 10, "bold")).pack(anchor="w")
+        tk.Label(text, text=target.note, bg=C["card"], fg=C["muted"], font=(FONT, 9),
+                 justify="left", wraplength=720, anchor="w").pack(anchor="w", fill="x")
+
+    def add_custom_dir(self) -> None:
+        path = filedialog.askdirectory(title="选择要清理的目录")
+        if not path:
+            return
+        reason = core.is_dangerous_dir(path)
+        if reason:
+            messagebox.showwarning(
+                "无法添加",
+                f"{reason}。\n\n请选择更具体的子目录, 例如某个软件的缓存目录。")
+            return
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in {os.path.normcase(os.path.abspath(p)) for p in self.custom_dirs}:
+            messagebox.showinfo("提示", "该目录已在清理列表中。")
+            return
+        if not messagebox.askyesno(
+            "确认添加",
+            f"将把以下目录加入清理列表:\n{path}\n\n"
+            "清理时该目录下的所有文件都会被直接删除(子目录本身保留), 不会进入回收站。\n"
+            "请确认目录中不含还需要保留的文件。确定添加吗?",
+        ):
+            return
+        self.custom_dirs.append(path)
+        if not core.save_custom_dirs(self.custom_dirs):
+            messagebox.showwarning("提示", "设置保存失败, 本次添加仅在当前会话有效。")
+        self._reload_temp_targets()
+        self.set_status(f"已添加清理目录: {path}")
+
+    def remove_custom_dir(self, path: str) -> None:
+        normalized = os.path.normcase(os.path.abspath(path))
+        self.custom_dirs = [p for p in self.custom_dirs
+                            if os.path.normcase(os.path.abspath(p)) != normalized]
+        if not core.save_custom_dirs(self.custom_dirs):
+            messagebox.showwarning("提示", "设置保存失败, 移除操作仅在当前会话有效。")
+        self._reload_temp_targets()
+        self.set_status(f"已移除清理目录: {path}")
 
     def _selected_targets(self) -> list[core.CleanTarget]:
         return [t for t in self.temp_targets if self.temp_vars[t.key].get()]
@@ -729,11 +942,16 @@ class CleanerApp:
         if not targets:
             messagebox.showinfo("提示", "请至少勾选一个清理位置。")
             return
+        custom = [t for t in targets if t.custom]
+        warning = (
+            "\n\n注意: 以下自定义目录中的所有文件都会被删除:\n"
+            + "\n".join(t.paths[0] for t in custom)
+        ) if custom else ""
         if not messagebox.askyesno(
             "确认清理",
             "将直接删除选中位置中的临时文件(不进入回收站)。\n\n"
-            "正被程序使用的文件会被自动保留、不会删除, 因此不会影响正在运行的程序。\n"
-            "确定继续吗?",
+            "正被程序使用的文件会被自动保留、不会删除, 因此不会影响正在运行的程序。"
+            f"{warning}\n\n确定继续吗?",
         ):
             return
 
@@ -745,10 +963,14 @@ class CleanerApp:
             if result.blocked:
                 text += f" 为安全起见保留 {result.blocked} 个正在被程序使用的文件(未尝试删除)。"
             if result.skipped:
-                text += f" 另有 {result.skipped} 个文件因权限不足未删除。"
+                text += f" 另有 {result.skipped} 个文件未能删除(可能被占用或权限不足)。"
+            delta, disks = core.free_space_delta(result.free_before)
+            if disks and delta > 0:
+                text += f" 磁盘可用空间实际增加 {core.human_size(delta)}。"
             self.temp_summary.configure(text=text)
             self.set_status("清理完成")
             self.temp_tree.delete(*self.temp_tree.get_children())
+            self._reclaim_cache = None
 
         self.run_task(work, done)
 
@@ -815,7 +1037,9 @@ class CleanerApp:
                         self.large_size, width=8)
         Button(actions, "开始扫描", self.scan_large, fill=C["accent"], width=110).pack(side="left")
         Button(actions, "删除选中(移入回收站)", self.delete_selected_large, fill="#eef1f6",
-               hover="#e3e8f0", text_color=C["text"], width=190).pack(side="left", padx=8)
+               hover="#e3e8f0", text_color=C["text"], width=180).pack(side="left", padx=8)
+        Button(actions, "导出 CSV", lambda: self._export_tree(self.large_tree, "大文件"),
+               fill="#eef1f6", hover="#e3e8f0", text_color=C["text"], width=96).pack(side="left")
 
         tk.Label(parent, text=LEGEND_TEXT, bg=C["bg"], fg=C["faint"], font=(FONT, 9),
                  wraplength=900, justify="left").pack(anchor="w", pady=(8, 0))
@@ -835,6 +1059,9 @@ class CleanerApp:
             files, scanned = core.scan_large_files(root, min_size=min_size, cancel=cancel, progress=report)
             report("正在检查文件占用情况…", 0, 0)
             locked = core.check_in_use([path for path, _size in files])
+            # 预热风险识别所需的安装目录, 避免界面渲染时再读取注册表/快捷方式/进程模块
+            core.installed_program_dirs()
+            core.running_program_dirs()
             return files, scanned, locked
 
         def done(result: tuple[list[tuple[str, int]], int, set[str]]) -> None:
@@ -848,10 +1075,17 @@ class CleanerApp:
                 self.large_tree.insert("", "end", iid=iid, tags=tags, values=(
                     state, core.human_size(size), os.path.basename(path), os.path.dirname(path)))
             total = sum(size for _path, size in files)
-            protected = sum(1 for path, _size in files
-                            if path in locked or core.deletion_risk(path))
+            protected = 0
+            notices = 0
+            for path, _size in files:
+                if path in locked or core.deletion_risk(path):
+                    protected += 1
+                elif core.deletion_notice(path):
+                    notices += 1
             extra = (f" 其中 {protected} 个受保护(正被使用或属系统/程序文件), 不会被删除。"
-                     if protected else " 未发现受保护的文件, 这批都可以删除。")
+                     if protected else " 未发现受保护的文件。")
+            if notices:
+                extra += f" 另有 {notices} 个安装包/日志/备份等文件, 删除前建议确认。"
             self.large_summary.configure(
                 text=f"扫描 {scanned} 个文件, 找到 {len(files)} 个大于 {self.large_size.get()} 的文件, "
                      f"合计 {core.human_size(total)}。{extra}")
@@ -874,23 +1108,33 @@ class CleanerApp:
                 "受保护 = 正在被程序使用, 或属于系统 / 已安装程序的文件。",
             )
             return
-        total = sum(os.path.getsize(p) for p in allowed if os.path.exists(p))
+        total = core.total_size(allowed)
         blocked_note = (f"\n其中 {len(blocked)} 个受保护({self._blocked_summary(blocked)}), 已排除、不会删除。"
                         if blocked else "")
+        notice_note = self._notice_note(allowed)
         if not messagebox.askyesno(
             "确认删除",
             f"将把 {len(allowed)} 个文件(共 {core.human_size(total)})移入回收站。"
-            f"{blocked_note}\n\n之后仍可从回收站还原。确定继续吗?",
+            f"{blocked_note}{notice_note}\n\n之后仍可从回收站还原。确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "大文件", self._prune_large_tree)
 
     def _prune_large_tree(self, failed: list[str]) -> None:
-        failed_set = set(failed)
+        """移除确实已消失的行。
+
+        因受保护而被跳过的文件仍然存在, 必须继续显示, 否则用户会误以为已删除。
+        """
         for iid, path in list(self.large_paths.items()):
-            if path not in failed_set and self.large_tree.exists(iid):
+            if os.path.exists(path):
+                continue
+            if self.large_tree.exists(iid):
                 self.large_tree.delete(iid)
-                del self.large_paths[iid]
+            del self.large_paths[iid]
+        remaining = list(self.large_paths.values())
+        total = core.total_size(remaining)
+        self.large_summary.configure(
+            text=f"剩余 {len(remaining)} 个文件, 合计 {core.human_size(total)}。")
 
     # -------------------------------------------------------- 重复文件页
 
@@ -904,9 +1148,11 @@ class CleanerApp:
                         self.dup_size, width=8)
         Button(actions, "开始查找", self.scan_dups, fill=C["accent"], width=110).pack(side="left")
         Button(actions, "每组保留一个", self.delete_dup_extras, fill="#eef1f6", hover="#e3e8f0",
-               text_color=C["text"], width=130).pack(side="left", padx=8)
+               text_color=C["text"], width=120).pack(side="left", padx=8)
         Button(actions, "删除选中项", self.delete_selected_dups, fill="#eef1f6", hover="#e3e8f0",
-               text_color=C["text"], width=120).pack(side="left")
+               text_color=C["text"], width=110).pack(side="left")
+        Button(actions, "导出 CSV", lambda: self._export_tree(self.dup_tree, "重复文件"),
+               fill="#eef1f6", hover="#e3e8f0", text_color=C["text"], width=92).pack(side="left", padx=8)
 
         tk.Label(parent, text="按文件内容比对。'每组保留一个'会保留每组中排在最前的一份, 其余移入回收站。",
                  bg=C["bg"], fg=C["faint"], font=(FONT, 9)).pack(anchor="w", pady=(8, 0))
@@ -919,6 +1165,7 @@ class CleanerApp:
             [("state", "删除提示", 90, "center"), ("size", "单份大小", 100, "e"),
              ("count", "份数", 60, "e"), ("name", "文件", 280, "w"),
              ("path", "所在目录", 420, "w")],
+            sortable=False,
         )
 
     def scan_dups(self) -> None:
@@ -929,41 +1176,55 @@ class CleanerApp:
             groups = core.find_duplicates(root, min_size=min_size, cancel=cancel, progress=report)
             report("正在检查文件占用情况…", 0, 0)
             locked = core.check_in_use([path for group in groups for path in group.files])
+            core.installed_program_dirs()
+            core.running_program_dirs()
             return groups, locked
 
         def done(result: tuple[list[core.DupGroup], set[str]]) -> None:
             groups, locked = result
             self.dup_groups = groups
-            self.dup_tree.delete(*self.dup_tree.get_children())
-            self.dup_paths.clear()
-            wasted = 0
-            for group_index, group in enumerate(groups):
-                parent_iid = self.dup_tree.insert(
-                    "", "end", tags=("group",), open=False,
-                    values=("", core.human_size(group.size), len(group.files),
-                            f"重复 {len(group.files)} 份", ""),
-                )
-                for file_index, path in enumerate(group.files):
-                    iid = f"{group_index}-{file_index}"
-                    self.dup_paths[iid] = path
-                    state, tags = self._row_status(file_index, path, locked)
-                    self.dup_tree.insert(parent_iid, "end", iid=iid, tags=tags, values=(
-                        state, core.human_size(group.size), "", os.path.basename(path),
-                        os.path.dirname(path)))
-                wasted += group.wasted_bytes
+            self.dup_locked = locked
+            self._render_dup_groups()
             if groups:
+                wasted = sum(group.wasted_bytes for group in groups)
                 summary = (f"发现 {len(groups)} 组重复文件, 每组只保留一份可释放约 "
                            f"{core.human_size(wasted)}。")
-                protected = sum(1 for group in groups for path in group.files
-                                if path in locked or core.deletion_risk(path))
+                protected = 0
+                notices = 0
+                for group in groups:
+                    for path in group.files:
+                        if path in locked or core.deletion_risk(path):
+                            protected += 1
+                        elif core.deletion_notice(path):
+                            notices += 1
                 if protected:
                     summary += f" 其中 {protected} 个受保护, 不会被删除。"
+                if notices:
+                    summary += f" 另有 {notices} 个文件属于安装包/日志等类型, 删除前建议确认。"
             else:
                 summary = "未发现重复文件。"
             self.dup_summary.configure(text=summary)
             self.set_status("查找完成")
 
         self.run_task(work, done)
+
+    def _render_dup_groups(self) -> None:
+        """按 self.dup_groups 重建分组表格。"""
+        self.dup_tree.delete(*self.dup_tree.get_children())
+        self.dup_paths.clear()
+        for group_index, group in enumerate(self.dup_groups):
+            parent_iid = self.dup_tree.insert(
+                "", "end", tags=("group",), open=False,
+                values=("", core.human_size(group.size), len(group.files),
+                        f"重复 {len(group.files)} 份", ""),
+            )
+            for file_index, path in enumerate(group.files):
+                iid = f"{group_index}-{file_index}"
+                self.dup_paths[iid] = path
+                state, tags = self._row_status(file_index, path, self.dup_locked)
+                self.dup_tree.insert(parent_iid, "end", iid=iid, tags=tags, values=(
+                    state, core.human_size(group.size), "", os.path.basename(path),
+                    os.path.dirname(path)))
 
     def delete_dup_extras(self) -> None:
         if not self.dup_groups:
@@ -982,13 +1243,14 @@ class CleanerApp:
                 "受保护 = 正在被程序使用, 或属于系统 / 已安装程序的文件。",
             )
             return
-        total = sum(os.path.getsize(p) for p in allowed if os.path.exists(p))
+        total = core.total_size(allowed)
         blocked_note = (f"\n其中 {len(blocked)} 个受保护({self._blocked_summary(blocked)}), 已排除、不会删除。"
                         if blocked else "")
+        notice_note = self._notice_note(allowed)
         if not messagebox.askyesno(
             "确认删除",
             f"将把 {len(allowed)} 个重复文件(共 {core.human_size(total)})移入回收站, 每组保留一份。"
-            f"{blocked_note}\n\n确定继续吗?",
+            f"{blocked_note}{notice_note}\n\n确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "重复文件", self._prune_dup_tree)
@@ -1008,30 +1270,31 @@ class CleanerApp:
                 "受保护 = 正在被程序使用, 或属于系统 / 已安装程序的文件。",
             )
             return
-        total = sum(os.path.getsize(p) for p in allowed if os.path.exists(p))
+        total = core.total_size(allowed)
         blocked_note = (f"\n其中 {len(blocked)} 个受保护({self._blocked_summary(blocked)}), 已排除、不会删除。"
                         if blocked else "")
+        notice_note = self._notice_note(allowed)
         if not messagebox.askyesno(
             "确认删除",
             f"将把选中的 {len(allowed)} 个文件(共 {core.human_size(total)})移入回收站。"
-            f"{blocked_note}\n\n确定继续吗?",
+            f"{blocked_note}{notice_note}\n\n确定继续吗?",
         ):
             return
         self._move_to_recycle(allowed, "重复文件", self._prune_dup_tree)
 
     def _prune_dup_tree(self, failed: list[str]) -> None:
-        failed_set = set(failed)
-        removed: set[str] = set()
-        for iid, path in list(self.dup_paths.items()):
-            if path not in failed_set:
-                removed.add(path)
-                if self.dup_tree.exists(iid):
-                    self.dup_tree.delete(iid)
-                del self.dup_paths[iid]
+        """移除确实已消失的文件; 受保护而被跳过的文件保留, 并同步分组信息。"""
         for group in self.dup_groups:
-            group.files = [p for p in group.files if p not in removed]
-        self.dup_groups = [g for g in self.dup_groups if len(g.files) > 1]
-        self.dup_summary.configure(text=f"剩余 {len(self.dup_groups)} 组重复文件。")
+            group.files = [path for path in group.files if os.path.exists(path)]
+        self.dup_groups = [group for group in self.dup_groups if len(group.files) > 1]
+        self._render_dup_groups()
+        wasted = sum(group.wasted_bytes for group in self.dup_groups)
+        if self.dup_groups:
+            self.dup_summary.configure(
+                text=f"剩余 {len(self.dup_groups)} 组重复文件, 可释放约 "
+                     f"{core.human_size(wasted)}。")
+        else:
+            self.dup_summary.configure(text="已没有重复文件。")
 
     # ------------------------------------------------------------ 任务调度
 
@@ -1058,6 +1321,9 @@ class CleanerApp:
 
         silent=True 时不显示忙碌指示(用于后台的轻量查询)。
         """
+        if not silent and self._busy:
+            self.set_status("已有任务正在运行, 请等待完成或点击取消后再试。")
+            return
         if not silent:
             self.cancel_event.clear()
             self._set_busy(True)
@@ -1123,6 +1389,19 @@ class CleanerApp:
         for _path, reason in blocked:
             counts[reason] = counts.get(reason, 0) + 1
         return "、".join(f"{reason} {count} 个" for reason, count in sorted(counts.items()))
+
+    @staticmethod
+    def _notice_note(paths: list[str]) -> str:
+        """把"可删但需确认"的文件归类成一段提示, 无此类文件时返回空串。"""
+        counts: dict[str, int] = {}
+        for path in paths:
+            kind = core.deletion_notice(path)
+            if kind:
+                counts[kind] = counts.get(kind, 0) + 1
+        if not counts:
+            return ""
+        summary = "、".join(f"{kind} {count} 个" for kind, count in sorted(counts.items()))
+        return f"\n其中包含 {summary}, 删除前请确认仍需要保留。"
 
     def _move_to_recycle(self, paths: list[str], label: str, on_done=None) -> None:
         def work(cancel, report):

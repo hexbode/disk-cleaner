@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import ctypes
 import fnmatch
+import glob
 import hashlib
 import heapq
+import json
 import os
+import shutil
 import stat
+import struct
 import sys
 import threading
 import time
@@ -34,7 +38,10 @@ _FROZEN_ROOT = os.path.abspath(sys._MEIPASS) if getattr(sys, "_MEIPASS", None) e
 
 def _is_own_runtime(path: str) -> bool:
     """路径是否属于程序自身的运行时解压目录(仅打包运行时存在)。"""
-    return _FROZEN_ROOT is not None and path.startswith(_FROZEN_ROOT)
+    if _FROZEN_ROOT is None:
+        return False
+    # 加分隔符比较, 避免把 _MEI1234 误判成 _MEI123 的子路径
+    return path == _FROZEN_ROOT or path.startswith(_FROZEN_ROOT + os.sep)
 
 
 # 取消检查函数: 返回 True 表示应当中止
@@ -53,6 +60,17 @@ def human_size(num: float) -> str:
             return f"{int(num)} B" if unit == "B" else f"{num:,.1f} {unit}"
         num /= 1024.0
     return f"{num:,.1f} PB"
+
+
+def total_size(paths: Iterable[str]) -> int:
+    """安全地求和一批文件的大小; 已消失或无权限的文件按 0 计。"""
+    total = 0
+    for path in paths:
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return total
 
 
 def is_admin() -> bool:
@@ -90,6 +108,17 @@ def _matches(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(lowered, p.lower()) for p in patterns)
 
 
+# 目录联接(junction)、符号链接等重解析点。遍历时若跟进去, 可能重复扫描甚至死循环,
+# 也可能顺着链接删到目录之外, 因此一律不跟随。
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    """该目录项是否为重解析点(junction / 符号链接)。"""
+    attrs = getattr(info, "st_file_attributes", 0)
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _iter_files(root: str, cancel: CancelCheck | None = None) -> Iterator[tuple[str, int]]:
     """递归遍历 root 下的所有普通文件, 产出 (完整路径, 字节大小)。
 
@@ -114,7 +143,7 @@ def _iter_files(root: str, cancel: CancelCheck | None = None) -> Iterator[tuple[
                     except OSError:
                         continue
                     if stat.S_ISDIR(info.st_mode):
-                        if not _is_own_runtime(entry.path):
+                        if not _is_reparse_point(info) and not _is_own_runtime(entry.path):
                             stack.append(entry.path)
                     elif stat.S_ISREG(info.st_mode):
                         if not _is_own_runtime(entry.path):
@@ -314,24 +343,344 @@ def check_in_use(paths: Iterable[str], modules: set[str] | None = None) -> set[s
 
 # ------------------------------------------------------------ 删除风险分类
 
-_RISK_DISK_EXT = {".vdi", ".vhdx", ".vhd"}
-_RISK_DATA_EXT = {".db", ".db3", ".sqlite", ".sqlite3", ".mdb", ".accdb"}
+_RISK_DISK_EXT = {".vdi", ".vhdx", ".vhd", ".vmdk", ".qcow2", ".avhdx"}
+_RISK_DATA_EXT = {
+    ".db", ".db3", ".sqlite", ".sqlite3", ".mdb", ".accdb",
+    ".pst", ".mdf", ".ldf", ".ndf",  # Outlook 邮件库 / SQL Server 数据库
+}
 _RISK_DATA_SUFFIX = (".db-wal", ".db-shm")
 _RISK_PROGRAM_EXT = {".dll", ".sys", ".ocx", ".node", ".asar"}
+
+# 系统关键目录: 删除其中的文件会破坏 Windows 或已安装的程序。
+# 只覆盖明确"不可删"的目录; Windows\Temp、SoftwareDistribution\Download、
+# Prefetch 等可清理位置不在此列。
 _RISK_PROGRAM_DIRS = (
     "\\windowsapps\\",
     "\\program files\\",
     "\\program files (x86)\\",
-    "\\app\\modules\\",
+    "\\windows\\winsxs\\",
+    "\\windows\\system32\\",
+    "\\windows\\syswow64\\",
+    "\\windows\\systemapps\\",
+    "\\windows\\servicing\\",
+    "\\windows\\installer\\",
+    "\\windows\\assembly\\",
+    "\\windows\\microsoft.net\\",
+    "\\windows\\boot\\",
+    "\\windows\\fonts\\",
+    "\\windows\\inf\\",
+    "\\programdata\\package cache\\",
+    "\\programdata\\microsoft\\windows defender\\",
+    "\\programdata\\microsoft\\windows\\systemdata\\",
+    "\\appdata\\local\\programs\\",
+    "\\system volume information\\",
+    "\\$recycle.bin\\",
+    "\\recovery\\",
     "\\resources\\app\\",
 )
 _INSTALLER_MARKERS = ("install", "setup", "uninst")
+
+# 可以删除、但值得提醒的类型(例如下载的安装包、日志、备份)。
+# 这些只做提示, 不阻止删除。
+_NOTICE_EXT = {
+    ".msi": "安装包",
+    ".msp": "安装包",
+    ".msm": "安装包",
+    ".log": "日志文件",
+    ".bak": "备份文件",
+    ".iso": "光盘镜像",
+    ".img": "磁盘镜像",
+    ".ost": "邮件缓存",
+}
+
+
+# 读取注册表安装信息的缓存: 枚举一次开销约几十毫秒, 短时间内复用。
+_INSTALL_DIRS_TTL = 120.0
+_install_dirs_cache: tuple[float, tuple[str, ...]] | None = None
+
+
+def _read_uninstall_locations() -> list[str]:
+    """从卸载注册表项读取各程序的安装目录。
+
+    优先使用 InstallLocation; 部分程序只登记了 DisplayIcon, 则取其可执行
+    文件所在目录。读取失败或无权限的条目直接跳过。
+    """
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    roots = (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+    locations: list[str] = []
+    for root, subkey in roots:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                count = winreg.QueryInfoKey(key)[0]
+                for index in range(count):
+                    try:
+                        name = winreg.EnumKey(key, index)
+                        with winreg.OpenKey(key, name) as entry:
+                            location = _read_location(winreg, entry)
+                    except OSError:
+                        continue
+                    if location:
+                        locations.append(location)
+        except OSError:
+            continue
+    return locations
+
+
+def _read_location(winreg, entry) -> str | None:
+    """从一个卸载项里解析安装目录。"""
+    for value_name in ("InstallLocation", "DisplayIcon"):
+        try:
+            raw = winreg.QueryValueEx(entry, value_name)[0]
+        except OSError:
+            continue
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = os.path.expandvars(raw.split(",")[0].strip().strip('"'))
+        if value_name == "DisplayIcon":
+            if not text.lower().endswith(".exe"):
+                continue
+            text = os.path.dirname(text)
+        return text
+    return None
+
+
+# ---------------------------------------------------- 开始菜单快捷方式
+# 绿色软件通常不写卸载注册表, 但一般会创建开始菜单快捷方式。解析 .lnk 的
+# 目标路径(Shell Link 二进制格式), 就能反推它实际安装在哪个目录。
+
+_START_MENU_SUBDIR = os.path.join("Microsoft", "Windows", "Start Menu", "Programs")
+
+
+def _start_menu_dirs() -> list[str]:
+    """系统和当前用户的开始菜单程序目录。"""
+    program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    app_data = os.environ.get("APPDATA", "")
+    candidates = [os.path.join(program_data, _START_MENU_SUBDIR)]
+    if app_data:
+        candidates.append(os.path.join(app_data, _START_MENU_SUBDIR))
+    return _existing_dirs(candidates)
+
+
+def _read_utf16z(data: bytes, offset: int) -> str | None:
+    """读取 UTF-16LE 的 NUL 结尾字符串。"""
+    if offset >= len(data):
+        return None
+    text = data[offset:].decode("utf-16-le", errors="ignore").split("\x00", 1)[0]
+    return text or None
+
+
+def _read_ansiz(data: bytes, offset: int) -> str | None:
+    """读取 ANSI(系统代码页)的 NUL 结尾字符串。"""
+    if offset >= len(data):
+        return None
+    raw = data[offset:].split(b"\x00", 1)[0]
+    text = raw.decode("mbcs", errors="ignore")
+    return text or None
+
+
+def _parse_link_info(info: bytes) -> str | None:
+    """从 LinkInfo 结构中取 LocalBasePath(优先 Unicode 版本)。"""
+    if len(info) < 0x1C:
+        return None
+    header_size = struct.unpack_from("<I", info, 4)[0]
+    # LinkInfoHeaderSize >= 0x24 时才有 Unicode 路径字段
+    if header_size >= 0x24 and len(info) >= 0x24:
+        unicode_offset = struct.unpack_from("<I", info, 0x1C)[0]
+        if unicode_offset:
+            text = _read_utf16z(info, unicode_offset)
+            if text:
+                return text
+    local_offset = struct.unpack_from("<I", info, 16)[0]
+    if local_offset:
+        return _read_ansiz(info, local_offset)
+    return None
+
+
+def _read_string_data(data: bytes, offset: int,
+                      is_unicode: bool) -> tuple[str | None, int]:
+    """读取一段 StringData(长度 WORD + 字符串), 返回 (文本, 新偏移)。"""
+    if offset + 2 > len(data):
+        return None, offset
+    count = struct.unpack_from("<H", data, offset)[0]
+    offset += 2
+    size = count * 2 if is_unicode else count
+    raw = data[offset:offset + size]
+    offset += size
+    encoding = "utf-16-le" if is_unicode else "mbcs"
+    return raw.decode(encoding, errors="ignore"), offset
+
+
+def _parse_shortcut(data: bytes, base_dir: str) -> str | None:
+    """解析 .lnk 内容, 返回目标程序所在目录; 无法解析时返回 None。
+
+    base_dir 是快捷方式自身所在目录, 用于解析相对目标路径。
+    """
+    if len(data) < 0x4C or data[:4] != b"L\x00\x00\x00":
+        return None
+    flags = struct.unpack_from("<I", data, 0x14)[0]
+    offset = 0x4C
+    unicode_flag = bool(flags & 0x80)
+
+    if flags & 0x01:  # HasLinkTargetIDList: 跳过整个 IDList
+        if offset + 2 > len(data):
+            return None
+        id_list_size = struct.unpack_from("<H", data, offset)[0]
+        offset += 2 + id_list_size
+
+    target = None
+    if flags & 0x02:  # HasLinkInfo
+        if offset + 4 > len(data):
+            return None
+        info_size = struct.unpack_from("<I", data, offset)[0]
+        if info_size < 0x1C or offset + info_size > len(data):
+            return None
+        target = _parse_link_info(data[offset:offset + info_size])
+        offset += info_size
+
+    # StringData 按固定顺序排列: 名称 / 相对路径 / 工作目录 / 参数 / 图标
+    relative = working = None
+    if flags & 0x04:  # HasName
+        _name, offset = _read_string_data(data, offset, unicode_flag)
+    if flags & 0x08:  # HasRelativePath
+        relative, offset = _read_string_data(data, offset, unicode_flag)
+    if flags & 0x10:  # HasWorkingDir
+        working, offset = _read_string_data(data, offset, unicode_flag)
+
+    candidate = target or relative or working
+    if not candidate:
+        return None
+    candidate = os.path.expandvars(candidate)
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(base_dir, candidate)
+    if candidate.lower().endswith(".exe"):
+        candidate = os.path.dirname(candidate)
+    return candidate or None
+
+
+def _shortcut_target(path: str) -> str | None:
+    """读取单个 .lnk 并返回其目标所在目录。"""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(256 * 1024)
+        return _parse_shortcut(data, os.path.dirname(path))
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def _shortcut_locations() -> list[str]:
+    """扫描开始菜单中的快捷方式, 汇总它们指向的程序目录。"""
+    locations: list[str] = []
+    for root in _start_menu_dirs():
+        for path, _size in _iter_files(root):
+            if not path.lower().endswith(".lnk"):
+                continue
+            target = _shortcut_target(path)
+            if target:
+                locations.append(target)
+    return locations
+
+
+def _usable_install_dir(path: str) -> str | None:
+    """规范化为可用的程序目录; 过宽或不存在的位置返回 None。
+
+    排除盘符根、单层目录、Windows / ProgramData、用户目录本身, 以及
+    %TEMP% 下的临时解压目录, 避免因为某个安装器把范围写得过大而误保护。
+    """
+    try:
+        normalized = os.path.normcase(os.path.abspath(path))
+    except (OSError, ValueError):
+        return None
+    if not os.path.isdir(normalized):
+        return None
+    _drive, tail = os.path.splitdrive(normalized)
+    parts = [part for part in tail.split(os.sep) if part]
+    if len(parts) < 2:
+        return None
+    top = parts[0].lower()
+    if top in ("windows", "programdata"):
+        return None
+    if top == "users" and len(parts) <= 2:
+        return None
+    if "\\appdata\\local\\temp\\" in normalized or "\\windows\\temp\\" in normalized:
+        return None
+    return normalized
+
+
+def installed_program_dirs(force: bool = False) -> tuple[str, ...]:
+    """已安装程序的实际目录列表(规范化小写)。
+
+    来源有两处: 卸载注册表(覆盖常规安装) 和开始菜单快捷方式(覆盖绿色软件)。
+    过宽的路径会被排除, 避免误保护整片区域。
+    """
+    global _install_dirs_cache
+    if not IS_WINDOWS:
+        return ()
+    now = time.monotonic()
+    if (not force and _install_dirs_cache is not None
+            and now - _install_dirs_cache[0] < _INSTALL_DIRS_TTL):
+        return _install_dirs_cache[1]
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for location in _read_uninstall_locations() + _shortcut_locations():
+        normalized = _usable_install_dir(location)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+
+    _install_dirs_cache = (now, tuple(result))
+    return _install_dirs_cache[1]
+
+
+# 正在运行的程序目录变化较快, 用较短的缓存
+_RUNNING_DIRS_TTL = 5.0
+_running_dirs_cache: tuple[float, tuple[str, ...]] | None = None
+
+
+def running_program_dirs(force: bool = False) -> tuple[str, ...]:
+    """当前运行进程所加载模块(EXE/DLL)所在的程序目录。
+
+    用来兜底既没有卸载注册表、也没有开始菜单快捷方式的便携软件:
+    只要它正在运行, 其所在目录就能被识别并保护。
+    """
+    global _running_dirs_cache
+    if not IS_WINDOWS:
+        return ()
+    now = time.monotonic()
+    if (not force and _running_dirs_cache is not None
+            and now - _running_dirs_cache[0] < _RUNNING_DIRS_TTL):
+        return _running_dirs_cache[1]
+
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for module in loaded_module_paths():
+        parent = _usable_install_dir(os.path.dirname(module))
+        if parent is None or parent in seen:
+            continue
+        seen.add(parent)
+        dirs.append(parent)
+
+    _running_dirs_cache = (now, tuple(dirs))
+    return _running_dirs_cache[1]
 
 
 def deletion_risk(path: str) -> str | None:
     """提示删除该文件可能损坏程序或丢失数据, 返回风险类别; 无风险返回 None。
 
-    这是启发式提示而非精确判定, 只针对"删错了后果较重"的类型。
+    判定顺序: 扩展名 → 系统关键目录 → 已安装程序的实际目录。
+    属于"可删但需注意"的类型(安装包、日志等)由 deletion_notice 单独提示。
     """
     name = os.path.basename(path).lower()
     ext = os.path.splitext(name)[1]
@@ -343,10 +692,26 @@ def deletion_risk(path: str) -> str | None:
         return "程序文件"
     if ext == ".exe" and not any(m in name for m in _INSTALLER_MARKERS):
         return "程序文件"
-    lowered = os.path.normcase(path)
+
+    lowered = os.path.normcase(os.path.abspath(path))
     if any(marker in lowered for marker in _RISK_PROGRAM_DIRS):
         return "程序文件"
+    for root in installed_program_dirs():
+        if lowered.startswith(root + os.sep):
+            return "程序文件"
+    for root in running_program_dirs():
+        if lowered.startswith(root + os.sep):
+            return "程序文件"
     return None
+
+
+def deletion_notice(path: str) -> str | None:
+    """返回"可以删除但建议确认"的类别; 无提示返回 None。
+
+    与 deletion_risk 不同, 这里的文件不会被阻止删除, 只在界面上给出提示。
+    """
+    ext = os.path.splitext(os.path.basename(path).lower())[1]
+    return _NOTICE_EXT.get(ext)
 
 
 def protection_reason(path: str, modules: set[str] | None = None) -> str | None:
@@ -397,6 +762,20 @@ class _SHQUERYRBINFO(ctypes.Structure):
     ]
 
 
+if IS_WINDOWS:
+    # 显式声明参数与返回值类型, 避免 64 位下指针/HRESULT 被按默认 int 处理
+    _shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    _SHFileOperationW = _shell32.SHFileOperationW
+    _SHFileOperationW.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
+    _SHFileOperationW.restype = ctypes.c_int
+    _SHQueryRecycleBinW = _shell32.SHQueryRecycleBinW
+    _SHQueryRecycleBinW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_SHQUERYRBINFO)]
+    _SHQueryRecycleBinW.restype = ctypes.c_long
+    _SHEmptyRecycleBinW = _shell32.SHEmptyRecycleBinW
+    _SHEmptyRecycleBinW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.DWORD]
+    _SHEmptyRecycleBinW.restype = ctypes.c_long
+
+
 def move_to_recycle_bin(paths: Iterable[str], chunk: int = 200) -> tuple[int, int, list[str]]:
     """把文件/文件夹移入回收站。
 
@@ -419,7 +798,7 @@ def move_to_recycle_bin(paths: Iterable[str], chunk: int = 200) -> tuple[int, in
         op.pFrom = "\0".join(batch) + "\0\0"
         op.pTo = None
         op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-        ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        _SHFileOperationW(ctypes.byref(op))
         # 以"文件是否还存在"作为判定依据, 结果更准确
         for path in batch:
             if os.path.exists(path):
@@ -436,7 +815,7 @@ def recycle_bin_info() -> tuple[int, int]:
     info = _SHQUERYRBINFO()
     info.cbSize = ctypes.sizeof(_SHQUERYRBINFO)
     try:
-        code = ctypes.windll.shell32.SHQueryRecycleBinW(None, ctypes.byref(info))
+        code = _SHQueryRecycleBinW(None, ctypes.byref(info))
     except OSError:
         return 0, 0
     if code != 0:
@@ -449,14 +828,16 @@ def empty_recycle_bin() -> tuple[bool, str]:
     if not IS_WINDOWS:
         return False, "当前系统不支持回收站清空。"
     try:
-        code = ctypes.windll.shell32.SHEmptyRecycleBinW(
+        code = _SHEmptyRecycleBinW(
             None, None, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND
         )
     except OSError as exc:
         return False, f"调用系统接口失败: {exc}"
     if code == 0:
         return True, "回收站已清空。"
-    # 0x8000FFFF 表示回收站本来就是空的
+    # 0x8000FFFF (E_UNEXPECTED) 在回收站本来就是空的时候也会返回
+    if (code & 0xFFFFFFFF) == 0x8000FFFF:
+        return True, "回收站已经是空的, 无需清理。"
     return False, f"清空回收站失败(错误码 0x{code & 0xFFFFFFFF:08X})。"
 
 
@@ -472,6 +853,7 @@ class CleanTarget:
     note: str = ""
     need_admin: bool = False
     enabled: bool = True
+    custom: bool = False  # 用户手工添加的目录, 可以移除
 
 
 @dataclass
@@ -500,12 +882,53 @@ class CleanResult:
     skipped: int = 0
     blocked: int = 0
     failed: list[str] = field(default_factory=list)
+    # 清理前各磁盘的可用空间, 供界面展示"实际释放了多少"
+    free_before: dict[str, int] = field(default_factory=dict)
+
+
+def _existing_dirs(paths: Iterable[str]) -> list[str]:
+    """筛出实际存在的目录, 并去掉重复项(保持顺序)。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen or not os.path.isdir(path):
+            continue
+        seen.add(normalized)
+        result.append(os.path.abspath(path))
+    return result
+
+
+def browser_cache_paths() -> list[str]:
+    """Chrome / Edge / Brave / Firefox 的网页缓存目录(含多用户配置)。"""
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local:
+        return []
+    user_data_dirs = [
+        os.path.join(local, "Google", "Chrome", "User Data"),
+        os.path.join(local, "Microsoft", "Edge", "User Data"),
+        os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"),
+        os.path.join(local, "Chromium", "User Data"),
+    ]
+    candidates: list[str] = []
+    for user_data in user_data_dirs:
+        candidates.append(os.path.join(user_data, "Default", "Cache"))
+        candidates.extend(glob.glob(os.path.join(user_data, "Profile *", "Cache")))
+        candidates.extend(glob.glob(os.path.join(user_data, "Profile*", "Cache")))
+    # Firefox 的缓存位于各配置目录下的 cache2, 配置目录名是随机串
+    candidates.extend(glob.glob(os.path.join(
+        local, "Mozilla", "Firefox", "Profiles", "*", "cache2")))
+    return _existing_dirs(candidates)
 
 
 def default_targets() -> list[CleanTarget]:
-    """返回默认的清理位置列表。"""
+    """返回内置的清理位置列表(只保留本机实际存在的目录)。"""
     local = os.environ.get("LOCALAPPDATA", "")
+    program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
     win = os.environ.get("SystemRoot", r"C:\Windows")
+    system_drive = os.path.splitdrive(win)[0] + "\\"
     user_temp = os.environ.get("TEMP") or os.path.join(local, "Temp")
 
     targets = [
@@ -536,8 +959,226 @@ def default_targets() -> list[CleanTarget]:
             patterns=["thumbcache_*.db", "iconcache_*.db"],
             note="资源管理器生成的缩略图与图标缓存(不影响个人文件)",
         ),
+        CleanTarget(
+            key="browser_cache",
+            label="浏览器缓存",
+            paths=browser_cache_paths(),
+            note="Chrome / Edge / Firefox 的网页缓存(不影响书签、密码与历史记录)",
+        ),
+        CleanTarget(
+            key="crash_dumps",
+            label="崩溃转储文件",
+            paths=[os.path.join(local, "CrashDumps")],
+            note="程序崩溃时生成的 .dmp 转储文件, 仅用于事后分析",
+        ),
+        CleanTarget(
+            key="inet_cache",
+            label="系统网络缓存",
+            paths=[os.path.join(local, "Microsoft", "Windows", "INetCache")],
+            note="IE / 系统组件下载产生的临时网页文件",
+        ),
+        CleanTarget(
+            key="d3d_cache",
+            label="DirectX 着色器缓存",
+            paths=[os.path.join(local, "D3DSCache")],
+            note="显卡着色器编译缓存, 删除后游戏首次启动会略慢",
+        ),
+        CleanTarget(
+            key="delivery_optimization",
+            label="传递优化缓存",
+            paths=[os.path.join(win, "SoftwareDistribution", "DeliveryOptimization")],
+            note="Windows 更新分发缓存; 需要管理员权限",
+            need_admin=True,
+        ),
+        CleanTarget(
+            key="prefetch",
+            label="预读取数据 (Prefetch)",
+            paths=[os.path.join(win, "Prefetch")],
+            note="系统预读取记录; 清理后程序首次启动会略慢, 需要管理员权限",
+            need_admin=True,
+        ),
+        CleanTarget(
+            key="error_reports",
+            label="Windows 错误报告",
+            paths=[os.path.join(program_data, "Microsoft", "Windows", "WER")],
+            note="系统与应用错误报告队列; 需要管理员权限",
+            need_admin=True,
+        ),
+        CleanTarget(
+            key="windows_old",
+            label="旧系统备份 (Windows.old)",
+            paths=[os.path.join(system_drive, "Windows.old")],
+            note="系统升级前的旧版本备份, 删除后无法回退到旧系统; 需要管理员权限, 默认不勾选",
+            need_admin=True,
+            enabled=False,
+        ),
     ]
     return [t for t in targets if any(os.path.isdir(p) for p in t.paths)]
+
+
+# ------------------------------------------------------------ 自定义目录
+
+_APP_DIR_NAME = "DiskCleaner"
+# 这些目录下的内容不适合作为"自定义清理目录": 删错会破坏系统或程序
+_FORBIDDEN_TOP_DIRS = {
+    "windows", "program files", "program files (x86)", "programdata",
+    "system volume information", "$recycle.bin", "recovery", "boot",
+}
+
+
+def app_data_dir() -> str:
+    """程序配置目录(%LOCALAPPDATA%\\DiskCleaner), 不可写时退回用户主目录。"""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, _APP_DIR_NAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except OSError:
+        return base
+
+
+def _settings_file() -> str:
+    return os.path.join(app_data_dir(), "settings.json")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_settings_file(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_settings(data: dict) -> bool:
+    """原子写入配置: 先写临时文件再替换, 避免中断后留下半截 JSON。"""
+    path = _settings_file()
+    temp = path + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(temp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        return False
+
+
+def load_custom_dirs(include_missing: bool = False) -> list[str]:
+    """读取用户保存的自定义清理目录。
+
+    配置文件可能被手工修改, 因此这里再次做安全检查:
+    位于系统 / 程序目录的路径一律忽略。
+    include_missing=True 时保留当前不可用的目录(例如暂时离线的网络盘),
+    供界面维护完整配置; 默认只返回当前可用的目录。
+    """
+    dirs = _load_settings().get("custom_dirs")
+    if not isinstance(dirs, list):
+        return []
+    safe = [d for d in dirs if isinstance(d, str) and is_dangerous_dir(d) is None]
+    return safe if include_missing else _existing_dirs(safe)
+
+
+def save_custom_dirs(dirs: Iterable[str]) -> bool:
+    """保存自定义清理目录, 返回是否写入成功。
+
+    这里不要求目录当前存在: 网络盘暂时离线时不应丢掉用户配置。
+    """
+    data = _load_settings()
+    saved: list[str] = []
+    seen: set[str] = set()
+    for path in dirs:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        saved.append(os.path.abspath(path))
+    data["custom_dirs"] = saved
+    return _save_settings(data)
+
+
+def custom_targets(dirs: Iterable[str] | None = None) -> list[CleanTarget]:
+    """把自定义目录转换成清理目标; 不传 dirs 时读取已保存的列表。
+
+    无论来源如何, 危险目录都会被过滤掉, 避免绕过界面校验。
+    """
+    paths = _existing_dirs(dirs) if dirs is not None else load_custom_dirs()
+    targets = []
+    for path in paths:
+        if is_dangerous_dir(path) is not None or not os.path.isdir(path):
+            continue
+        name = os.path.basename(path.rstrip("\\/")) or path
+        targets.append(CleanTarget(
+            key=f"custom:{os.path.normcase(path)}",
+            label=name,
+            paths=[path],
+            note=f"自定义目录: {path}",
+            custom=True,
+        ))
+    return targets
+
+
+def is_dangerous_dir(path: str) -> str | None:
+    """检查自定义目录是否安全; 返回拒绝原因, 允许则返回 None。
+
+    拒绝盘符根目录与系统 / 程序目录, 避免用户把整个系统盘加入清理列表。
+    """
+    if not path:
+        return "路径为空"
+    full = os.path.abspath(path)
+    _drive, tail = os.path.splitdrive(full)
+    parts = [part for part in tail.replace("/", "\\").split("\\") if part]
+    if not parts:
+        return "不能选择磁盘根目录"
+    top = parts[0].lower()
+    if top in _FORBIDDEN_TOP_DIRS or top.startswith("$"):
+        return "不能选择系统或程序目录"
+    if top == "users" and len(parts) <= 2:
+        return "不能选择用户目录本身, 请选更具体的子目录"
+    return None
+
+
+def free_space_snapshot(targets: Iterable[CleanTarget]) -> dict[str, int]:
+    """记录各目标所在磁盘的当前可用空间 {盘符根: 字节数}。"""
+    roots: set[str] = set()
+    for target in targets:
+        for path in target.paths:
+            try:
+                root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+            except (OSError, ValueError):
+                continue
+            roots.add(root)
+    snapshot: dict[str, int] = {}
+    for root in roots:
+        try:
+            snapshot[root] = shutil.disk_usage(root).free
+        except OSError:
+            continue
+    return snapshot
+
+
+def free_space_delta(before: dict[str, int]) -> tuple[int, int]:
+    """对比当前可用空间与快照, 返回 (差值的合计, 参与统计的磁盘数)。
+
+    只统计差值为正(空间确实变多)的磁盘, 避免其它程序同时写盘造成负值干扰。
+    """
+    total = 0
+    counted = 0
+    for root, old in before.items():
+        try:
+            now = shutil.disk_usage(root).free
+        except OSError:
+            continue
+        counted += 1
+        delta = now - old
+        if delta > 0:
+            total += delta
+    return total, counted
 
 
 def scan_targets(
@@ -553,6 +1194,8 @@ def scan_targets(
     modules = loaded_module_paths()
 
     for target in targets:
+        if cancel is not None and cancel():
+            break
         for root in target.paths:
             for filepath, size in _iter_files(root, cancel):
                 if target.patterns and not _matches(os.path.basename(filepath), target.patterns):
@@ -608,7 +1251,7 @@ def _clean_tree(root: str, patterns: list[str], result: "CleanResult",
                     except OSError:
                         continue
                     if stat.S_ISDIR(info.st_mode):
-                        if not _is_own_runtime(entry.path):
+                        if not _is_reparse_point(info) and not _is_own_runtime(entry.path):
                             stack.append((entry.path, False))
                     elif stat.S_ISREG(info.st_mode):
                         if _is_own_runtime(entry.path) or not _matches(entry.name, patterns):
@@ -642,8 +1285,12 @@ def clean_targets(
     被程序使用的文件一律跳过、不删除。
     """
     result = CleanResult()
+    targets = list(targets)
+    result.free_before = free_space_snapshot(targets)
     modules = loaded_module_paths()
     for target in targets:
+        if cancel is not None and cancel():
+            break
         for root in target.paths:
             if not os.path.isdir(root):
                 continue
